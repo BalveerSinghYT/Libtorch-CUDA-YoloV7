@@ -1,5 +1,3 @@
-// stole from Nebula4869 and update code for use GPU by LeTrongHieu
-
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/opencv.hpp>
@@ -15,73 +13,103 @@
 #include <typeinfo>
 
 std::vector<torch::Tensor> non_max_suppression(torch::Tensor preds, float score_thresh=0.5, float iou_thresh=0.5)
-{
-        std::vector<torch::Tensor> output;
-        for (size_t i=0; i < preds.sizes()[0]; ++i)
+{   
+    std::vector<torch::Tensor> output;
+    for (size_t i=0; i < preds.sizes()[0]; ++i)
+    {
+        torch::Tensor pred = preds.select(0, i);
+
+        // Filter by scores
+        std::cout<< "pred shape: " << pred.sizes() << std::endl;
+        torch::Tensor scores = pred.select(1, 4) * std::get<0>( torch::max(pred.slice(1, 5, 85), 1)); // 85 is the number of classes in yolo-seg.torchscript, change it to pred.sizes()[1] if you are using a different model
+        pred = torch::index_select(pred, 0, torch::nonzero(scores > score_thresh).select(1, 0));
+        if (pred.sizes()[0] == 0) continue;
+
+        // (center_x, center_y, w, h) to (left, top, right, bottom)
+        pred.select(1, 0) = pred.select(1, 0) - pred.select(1, 2) / 2;
+        pred.select(1, 1) = pred.select(1, 1) - pred.select(1, 3) / 2;
+        pred.select(1, 2) = pred.select(1, 0) + pred.select(1, 2);
+        pred.select(1, 3) = pred.select(1, 1) + pred.select(1, 3);
+
+        // Computing scores and classes
+        std::tuple<torch::Tensor, torch::Tensor> max_tuple = torch::max(pred.slice(1, 5, 85), 1); // 85 is the number of classes in yolo-seg.torchscript, change it to pred.sizes()[1] if you are using a different model
+        pred.select(1, 4) = pred.select(1, 4) * std::get<0>(max_tuple);
+        pred.select(1, 5) = std::get<1>(max_tuple);
+
+        torch::Tensor  dets = pred.slice(1, 0, 6);
+
+        torch::Tensor keep = torch::empty({dets.sizes()[0]});
+        torch::Tensor areas = (dets.select(1, 3) - dets.select(1, 1)) * (dets.select(1, 2) - dets.select(1, 0));
+        std::tuple<torch::Tensor, torch::Tensor> indexes_tuple = torch::sort(dets.select(1, 4), 0, 1);
+        torch::Tensor v = std::get<0>(indexes_tuple);
+        torch::Tensor indexes = std::get<1>(indexes_tuple);
+        int count = 0;
+        while (indexes.sizes()[0] > 0)
         {
-            torch::Tensor pred = preds.select(0, i);
+            keep[count] = (indexes[0].item().toInt());
+            count += 1;
 
-            // Filter by scores
-            torch::Tensor scores = pred.select(1, 4) * std::get<0>( torch::max(pred.slice(1, 5, pred.sizes()[1]), 1));
-            pred = torch::index_select(pred, 0, torch::nonzero(scores > score_thresh).select(1, 0));
-            if (pred.sizes()[0] == 0) continue;
-
-            // (center_x, center_y, w, h) to (left, top, right, bottom)
-            pred.select(1, 0) = pred.select(1, 0) - pred.select(1, 2) / 2;
-            pred.select(1, 1) = pred.select(1, 1) - pred.select(1, 3) / 2;
-            pred.select(1, 2) = pred.select(1, 0) + pred.select(1, 2);
-            pred.select(1, 3) = pred.select(1, 1) + pred.select(1, 3);
-            // Computing scores and classes
-            std::tuple<torch::Tensor, torch::Tensor> max_tuple = torch::max(pred.slice(1, 5, pred.sizes()[1]), 1);
-            pred.select(1, 4) = pred.select(1, 4) * std::get<0>(max_tuple);
-            torch::Tensor  dets = pred.slice(1, 0, 6);
-            torch::Tensor keep = torch::empty({dets.sizes()[0]});
-            torch::Tensor areas = (dets.select(1, 3) - dets.select(1, 1)) * (dets.select(1, 2) - dets.select(1, 0));
-            std::tuple<torch::Tensor, torch::Tensor> indexes_tuple = torch::sort(dets.select(1, 4), 0, 1);
-            torch::Tensor v = std::get<0>(indexes_tuple);
-            torch::Tensor indexes = std::get<1>(indexes_tuple);
-            int count = 0;
-            while (indexes.sizes()[0] > 0)
+            // Computing overlaps
+            torch::Tensor lefts = torch::empty(indexes.sizes()[0] - 1);
+            torch::Tensor tops = torch::empty(indexes.sizes()[0] - 1);
+            torch::Tensor rights = torch::empty(indexes.sizes()[0] - 1);
+            torch::Tensor bottoms = torch::empty(indexes.sizes()[0] - 1);
+            torch::Tensor widths = torch::empty(indexes.sizes()[0] - 1);
+            torch::Tensor heights = torch::empty(indexes.sizes()[0] - 1);
+            for (size_t i=0; i<indexes.sizes()[0] - 1; ++i)
             {
-                keep[count] = (indexes[0].item().toInt());
-                count += 1;
-
-                // Computing overlaps
-                torch::Tensor lefts = torch::empty(indexes.sizes()[0] - 1);
-                torch::Tensor tops = torch::empty(indexes.sizes()[0] - 1);
-                torch::Tensor rights = torch::empty(indexes.sizes()[0] - 1);
-                torch::Tensor bottoms = torch::empty(indexes.sizes()[0] - 1);
-                torch::Tensor widths = torch::empty(indexes.sizes()[0] - 1);
-                torch::Tensor heights = torch::empty(indexes.sizes()[0] - 1);
-                for (size_t i=0; i<indexes.sizes()[0] - 1; ++i)
-                {
-                    lefts[i] = std::max(dets[indexes[0]][0].item().toFloat(), dets[indexes[i + 1]][0].item().toFloat());
-                    tops[i] = std::max(dets[indexes[0]][1].item().toFloat(), dets[indexes[i + 1]][1].item().toFloat());
-                    rights[i] = std::min(dets[indexes[0]][2].item().toFloat(), dets[indexes[i + 1]][2].item().toFloat());
-                    bottoms[i] = std::min(dets[indexes[0]][3].item().toFloat(), dets[indexes[i + 1]][3].item().toFloat());
-                    widths[i] = std::max(float(0), rights[i].item().toFloat() - lefts[i].item().toFloat());
-                    heights[i] = std::max(float(0), bottoms[i].item().toFloat() - tops[i].item().toFloat());
-                }
-                torch::Tensor overlaps = widths * heights;
-
-                // Filter by IOUs
-                torch::Tensor ious = overlaps / (areas.select(0, indexes[0].item().toInt()) + torch::index_select(areas, 0, indexes.slice(0, 1, indexes.sizes()[0])) - overlaps);
-                indexes = torch::index_select(indexes, 0, torch::nonzero(ious <= iou_thresh).select(1, 0) + 1);
+                lefts[i] = std::max(dets[indexes[0]][0].item().toFloat(), dets[indexes[i + 1]][0].item().toFloat());
+                tops[i] = std::max(dets[indexes[0]][1].item().toFloat(), dets[indexes[i + 1]][1].item().toFloat());
+                rights[i] = std::min(dets[indexes[0]][2].item().toFloat(), dets[indexes[i + 1]][2].item().toFloat());
+                bottoms[i] = std::min(dets[indexes[0]][3].item().toFloat(), dets[indexes[i + 1]][3].item().toFloat());
+                widths[i] = std::max(float(0), rights[i].item().toFloat() - lefts[i].item().toFloat());
+                heights[i] = std::max(float(0), bottoms[i].item().toFloat() - tops[i].item().toFloat());
             }
-            keep = keep.toType(torch::kInt64);
-            output.push_back(torch::index_select(dets, 0, keep.slice(0, 0, count)));
+            torch::Tensor overlaps = widths * heights;
+
+            torch::Tensor ious = overlaps / (areas.select(0, indexes[0].item().toInt()) + torch::index_select(areas, 0, indexes.slice(0, 1, indexes.sizes()[0])) - overlaps);
+            indexes = torch::index_select(indexes, 0, torch::nonzero(ious <= iou_thresh).select(1, 0) + 1);
         }
-        return output;
+        keep = keep.toType(torch::kInt64);
+        output.push_back(torch::index_select(dets, 0, keep.slice(0, 0, count)));
+    }
+    return output;
 }
 
 
-int main()
+int main()  
 {
     // Loading  Module
-    torch::jit::script::Module module = torch::jit::load("../yolov7-tiny.torchscript.pt", torch::kCUDA);
+    std::vector<std::string> mClassnames;
+
+    torch::jit::script::Module module = torch::jit::load("yolov7-seg.torchscript", torch::kCUDA);
     module.to(at::kCUDA);
 
-    cv:: VideoCapture cap = cv::VideoCapture("out.mp4");
+    std::vector<std::string> class_labels = {
+    "person", "bicycle", "car", "motorbike", "aeroplane",
+    "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench",
+    "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack",
+    "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat",
+    "baseball glove", "skateboard", "surfboard", "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife",
+    "spoon", "bowl", "banana", "apple", "sandwich",
+    "orange", "broccoli", "carrot", "hot dog", "pizza",
+    "donut", "cake", "chair", "sofa", "pottedplant",
+    "bed", "diningtable", "toilet", "tvmonitor", "laptop",
+    "mouse", "remote", "keyboard", "cell phone", "microwave",
+    "oven", "toaster", "sink", "refrigerator", "book",
+    "clock", "vase", "scissors", "teddy bear", "hair drier",
+    "toothbrush"
+    };
+
+    
+    // Loading video
+    std::string video_path = "input/street_cycle.mp4";
+
+    cv:: VideoCapture cap = cv::VideoCapture(video_path);
     cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
     cv::Mat frame, image2;
@@ -105,8 +133,10 @@ int main()
         imgTensor = imgTensor.div(255);
         imgTensor = imgTensor.unsqueeze(0);
         imgTensor = imgTensor.to(at::kCUDA);
+        std::cout << "Input tensor shape: " << imgTensor.sizes() << std::endl;
         auto output = module.forward({imgTensor}).toTuple()->elements()[0].toTensor();
         output = output.to(at::kCPU);
+
         std::vector<torch::Tensor> dets = non_max_suppression(output, 0.5, 0.5);
 
         if (dets.size() > 0)
@@ -121,14 +151,22 @@ int main()
                 float score = dets[0][i][4].item().toFloat();
                 int classID = dets[0][i][5].item().toInt();
 
+                std::cout << "Class ID: " << classID << " Score: " << score << std::endl;
+
 				cv::rectangle(frame, cv::Rect(left, top, (right - left), (bottom - top)), cv::Scalar(0, 255, 0), 2);
+
+                if (classID < 0 || classID >= class_labels.size()) 
+                    continue;
+
+                std::string label = class_labels[classID] + " " + std::to_string(score);
+                std::cout << label << std::endl;
 
                 // print result here
 				cv::putText(frame,
-                            "",
+                            label,
                             cv::Point(left, top),
                             cv::FONT_HERSHEY_SIMPLEX,
-                            (right - left) / 200,
+                            1,
                             cv::Scalar(0, 255, 0),
                             2,
                             cv::LINE_AA,

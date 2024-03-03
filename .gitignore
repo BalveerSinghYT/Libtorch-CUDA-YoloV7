@@ -1,0 +1,8 @@
+build
+libtorch
+YOLOv7LibTorch
+.vscode
+.readme.MD
+*.pt
+*torchscript
+*.torchscript.pt
